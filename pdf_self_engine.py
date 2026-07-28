@@ -18,6 +18,9 @@ import pandas as pd
 import pdfplumber
 from rapidfuzz import fuzz, process
 
+from backend.prepare.manifest import PrepareManifest
+from backend.prepare.prepare_pdf import PreparePDF
+
 
 MNT_DATA = Path("/mnt/data")
 BACKEND_NAME_PATTERNS = ("*backend*.py", "*engine*.py", "pipeline*.py", "pdf_*.py")
@@ -107,6 +110,8 @@ class Context:
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     artifacts: dict[str, Any] = field(default_factory=dict)
+    prepare_manifest: PrepareManifest | None = None
+    prepared_sources: dict[int, tuple[Path, int, str]] = field(default_factory=dict)
 
 
 class Pipeline:
@@ -125,7 +130,7 @@ class Pipeline:
 
     def run(self, ctx: Context) -> Context:
         for stage in (
-            self.load_pdf, self.extract_vector_text, self.render_pages, self.extract_tables, self.preprocess,
+            self.prepare_pdf, self.load_pdf, self.extract_vector_text, self.render_pages, self.extract_tables, self.preprocess,
             self.ocr_pages, self.detect_legend, self.extract_bom_tables, self.extract_circuit_numbers,
             self.extract_rooms, self.detect_symbols, self.detect_devices, self.map_symbols_to_rooms,
             self.build_graph, self.validate, self.export,
@@ -155,7 +160,7 @@ class Pipeline:
             self.ocr_engine = module.PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
         return self.ocr_engine
 
-    def load_pdf(self, ctx: Context) -> Context:
+    def prepare_pdf(self, ctx: Context) -> Context:
         if not ctx.input_pdf.is_absolute() or not str(ctx.input_pdf).startswith(str(MNT_DATA) + "/"):
             raise ValueError(f"PDF musi mieć ścieżkę absolutną w /mnt/data: {ctx.input_pdf}")
         if not ctx.input_pdf.is_file():
@@ -163,32 +168,58 @@ class Pipeline:
         if ctx.output_dir.exists() and not ctx.output_dir.is_dir():
             raise NotADirectoryError(f"output_dir nie jest katalogiem: {ctx.output_dir}")
         ctx.output_dir.mkdir(parents=True, exist_ok=True)
-        ctx.document = fitz.open(ctx.input_pdf)
-        ctx.pages = list(range(len(ctx.document)))
-        for i in ctx.pages:
-            rect = ctx.document[i].rect
-            rec = self._record(ctx, i)
+        ctx.prepare_manifest = PreparePDF().run(ctx.input_pdf, ctx.output_dir)
+        return ctx
+
+    def load_pdf(self, ctx: Context) -> Context:
+        if ctx.prepare_manifest is None:
+            ctx.prepare_manifest = PrepareManifest.from_path(ctx.output_dir / "prepare" / "manifest.json")
+        ctx.pages = list(range(ctx.prepare_manifest.pages))
+        ctx.prepared_sources.clear()
+        for page_key, info in sorted(ctx.prepare_manifest.page_map.items(), key=lambda item: int(item[0])):
+            original_index = int(page_key) - 1
+            prepared_pdf = Path(info["prepared_pdf"])
+            prepared_page_index = int(info["prepared_page_index"])
+            category = str(info["category"])
+            ctx.prepared_sources[original_index] = (prepared_pdf, prepared_page_index, category)
+            with fitz.open(prepared_pdf) as doc:
+                rect = doc[prepared_page_index].rect
+            rec = self._record(ctx, original_index)
             rec.width, rec.height = float(rect.width), float(rect.height)
+            rec.markdown_path = None
         return ctx
 
     def extract_vector_text(self, ctx: Context) -> Context:
         for i in ctx.pages:
-            self._record(ctx, i).vector_text = self._normalize(ctx.document[i].get_text("text") or "")
+            prepared_pdf, prepared_page_index, category = ctx.prepared_sources[i]
+            with fitz.open(prepared_pdf) as doc:
+                rec = self._record(ctx, i)
+                rec.vector_text = self._normalize(doc[prepared_page_index].get_text("text") or "")
+                rec.markdown_path = None
         return ctx
 
     def render_pages(self, ctx: Context) -> Context:
         for i in ctx.pages:
-            pix = ctx.document[i].get_pixmap(dpi=self.dpi, alpha=False)
+            prepared_pdf, prepared_page_index, category = ctx.prepared_sources[i]
+            with fitz.open(prepared_pdf) as doc:
+                pix = doc[prepared_page_index].get_pixmap(dpi=self.dpi, alpha=False)
             ctx.images[i] = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
         return ctx
 
     def extract_tables(self, ctx: Context) -> Context:
-        with pdfplumber.open(ctx.input_pdf) as pdf:
-            for i, page in enumerate(pdf.pages):
-                try:
-                    self._record(ctx, i).tables = page.extract_tables() or []
-                except Exception as exc:
-                    ctx.warnings.append(f"Strona {i + 1}: nie udało się wyodrębnić tabel: {exc}")
+        grouped: dict[Path, list[tuple[int, int]]] = {}
+        for original_index, (prepared_pdf, prepared_page_index, category) in ctx.prepared_sources.items():
+            grouped.setdefault(prepared_pdf, []).append((original_index, prepared_page_index))
+        for prepared_pdf, page_pairs in grouped.items():
+            try:
+                with pdfplumber.open(prepared_pdf) as pdf:
+                    for original_index, prepared_page_index in page_pairs:
+                        try:
+                            self._record(ctx, original_index).tables = pdf.pages[prepared_page_index].extract_tables() or []
+                        except Exception as exc:
+                            ctx.warnings.append(f"Strona {original_index + 1}: nie udało się wyodrębnić tabel z przygotowanego PDF: {exc}")
+            except Exception as exc:
+                ctx.warnings.append(f"Nie można otworzyć przygotowanego PDF {prepared_pdf}: {exc}")
         return ctx
 
     def preprocess(self, ctx: Context) -> Context:
@@ -294,10 +325,11 @@ class Pipeline:
 
     def build_graph(self, ctx: Context) -> Context:
         g = nx.DiGraph()
-        g.add_node("document", kind="document", path=str(ctx.input_pdf))
+        g.add_node("document", kind="document", path=str(ctx.output_dir / "prepare"), source_pdf=str(ctx.input_pdf))
         for i, rec in ctx.page_records.items():
             pid = f"page:{rec.page_number}"
-            g.add_node(pid, kind="page", page_number=rec.page_number, width=rec.width, height=rec.height)
+            prepared = ctx.prepared_sources.get(i)
+            g.add_node(pid, kind="page", page_number=rec.page_number, width=rec.width, height=rec.height, category=prepared[2] if prepared else None, prepared_pdf=str(prepared[0]) if prepared else None)
             g.add_edge("document", pid, relation="contains")
             for collection_name in ("legend", "rooms", "circuits", "symbols", "devices"):
                 for idx, item in enumerate(getattr(rec, collection_name)):
@@ -339,8 +371,10 @@ class Pipeline:
         self._write_json(ctx.output_dir / "rooms.json", self._collect(ctx, "rooms"))
         self._write_json(ctx.output_dir / "devices.json", self._collect(ctx, "devices"))
         self._write_json(ctx.output_dir / "symbols.json", self._collect(ctx, "symbols"))
+        self._write_json(ctx.output_dir / "tables.json", self._collect_tables(ctx))
+        self._write_json(ctx.output_dir / "messages.json", {"warnings": ctx.warnings, "errors": ctx.errors})
         self._write_json(ctx.output_dir / "bom.json", ctx.bom)
-        summary = {"input_pdf": str(ctx.input_pdf), "backend_module": str(ctx.backend_module) if ctx.backend_module else None, "output_dir": str(ctx.output_dir), "pages": len(ctx.pages), "artifacts": {"pages": str(pages_dir), "tables": str(tables_dir), "ocr": str(ocr_dir), "graph": str(ctx.output_dir / "graph.json")}, "counts": {"tables": sum(len(r.tables) for r in ctx.page_records.values()), "ocr_pages": sum(1 for r in ctx.page_records.values() if r.ocr_result), "legend_entries": sum(len(r.legend) for r in ctx.page_records.values()), "rooms": sum(len(r.rooms) for r in ctx.page_records.values()), "circuits": sum(len(r.circuits) for r in ctx.page_records.values()), "symbols": sum(len(r.symbols) for r in ctx.page_records.values()), "devices": sum(len(r.devices) for r in ctx.page_records.values())}, "warnings": ctx.warnings, "errors": ctx.errors}
+        summary = {"input_pdf": str(ctx.input_pdf), "backend_module": str(ctx.backend_module) if ctx.backend_module else None, "output_dir": str(ctx.output_dir), "pages": len(ctx.pages), "prepare": str(ctx.output_dir / "prepare"), "artifacts": {"prepare_manifest": str(ctx.output_dir / "prepare" / "manifest.json"), "pages": str(pages_dir), "tables": str(tables_dir), "ocr": str(ocr_dir), "graph": str(ctx.output_dir / "graph.json")}, "counts": {"tables": sum(len(r.tables) for r in ctx.page_records.values()), "ocr_pages": sum(1 for r in ctx.page_records.values() if r.ocr_result), "legend_entries": sum(len(r.legend) for r in ctx.page_records.values()), "rooms": sum(len(r.rooms) for r in ctx.page_records.values()), "circuits": sum(len(r.circuits) for r in ctx.page_records.values()), "symbols": sum(len(r.symbols) for r in ctx.page_records.values()), "devices": sum(len(r.devices) for r in ctx.page_records.values())}, "warnings": ctx.warnings, "errors": ctx.errors}
         self._write_json(ctx.output_dir / "summary.json", summary)
         if not (ctx.output_dir / "summary.json").is_file():
             raise RuntimeError("summary.json nie został zapisany")
@@ -351,6 +385,9 @@ class Pipeline:
 
     def _collect(self, ctx: Context, attr: str) -> dict[str, list[dict[str, Any]]]:
         return {str(rec.page_number): [asdict(x) for x in getattr(rec, attr)] for rec in ctx.page_records.values() if getattr(rec, attr)}
+
+    def _collect_tables(self, ctx: Context) -> dict[str, list[list[list[Any]]]]:
+        return {str(rec.page_number): rec.tables for rec in ctx.page_records.values() if rec.tables}
 
     def _write_json(self, path: Path, data: Any) -> None:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
