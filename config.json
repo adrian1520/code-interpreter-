@@ -1,0 +1,78 @@
+{
+  "name": "pdf-self-engine-code-interpreter",
+  "version": "1.0.0",
+  "locale": "pl-PL",
+  "description": "Konfiguracja single-shot dla ChatGPT Code Interpreter: po otrzymaniu PDF z /mnt/data uruchamia deterministyczny backend analizy dokumentu i zapisuje artefakty w /mnt/data/output/<nazwa_pdf>.",
+  "runtime": {
+    "working_directory": "/mnt/data",
+    "network": false,
+    "single_shot": true,
+    "allowed_write_roots": [
+      "/mnt/data"
+    ],
+    "default_output_root": "/mnt/data/output",
+    "stdout_logging": true
+  },
+  "files": {
+    "launcher": "/mnt/data/pdf_backend_launcher.py",
+    "default_backend": "/mnt/data/pdf_self_engine.py",
+    "bootstrap": "/mnt/data/bootstrap.xml"
+  },
+  "input_contract": {
+    "input_pdf": {
+      "required": true,
+      "pattern": "/mnt/data/<nazwa>.pdf",
+      "description": "Jeden plik PDF przesłany do Code Interpreter."
+    },
+    "backend_module": {
+      "required": false,
+      "pattern": "/mnt/data/<nazwa_backendu>.py",
+      "selection": "Jeśli podano jawnie, użyj go; inaczej wybierz pierwszy plik pasujący do konwencji backendu."
+    },
+    "output_dir": {
+      "required": false,
+      "default_pattern": "/mnt/data/output/<nazwa_pdf>"
+    }
+  },
+  "backend_discovery": {
+    "patterns": [
+      "*backend*.py",
+      "*engine*.py",
+      "pipeline*.py",
+      "pdf_*.py"
+    ],
+    "entrypoints": [
+      "main(pdf_path, output_dir)",
+      "run(pdf_path, output_dir)",
+      "Pipeline().run(ctx)"
+    ],
+    "loader_function": "load_module_from_path(path)"
+  },
+  "output_contract": {
+    "required": [
+      "summary.json",
+      "pages/*.md",
+      "tables/*.csv",
+      "graph.json"
+    ],
+    "optional": [
+      "ocr/*.json",
+      "symbols.json",
+      "devices.json",
+      "rooms.json",
+      "bom.json",
+      "legend.json"
+    ],
+    "encoding": "utf-8",
+    "json_ensure_ascii": false
+  },
+  "gpt_behavior": {
+    "before_pdf": "Poproś użytkownika o przesłanie jednego pliku PDF do analizy.",
+    "after_pdf": "Uruchom run_pdf_analysis bez dodatkowych pytań i zwróć summary.json oraz listę zapisanych artefaktów.",
+    "on_missing_pdf": "Nie uruchamiaj backendu; poproś o PDF.",
+    "on_multiple_pdfs_without_explicit_choice": "Wybierz najnowszy PDF w /mnt/data według mtime i dodaj ostrzeżenie w podsumowaniu odpowiedzi."
+  },
+  "example_invocation": {
+    "python": "from pdf_backend_launcher import run_pdf_analysis\nresult = run_pdf_analysis('/mnt/data/projekt.pdf', '/mnt/data/output/projekt', '/mnt/data/pdf_self_engine.py')\nresult"
+  }
+}
