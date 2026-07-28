@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<codeInterpreterBootstrap name="pdf-self-engine" version="1.0" locale="pl-PL">
+  <purpose>
+    Inicjalizuje środowisko ChatGPT Code Interpreter dla deterministycznej analizy pojedynczego pliku PDF z /mnt/data, prosi użytkownika o PDF, a po jego otrzymaniu uruchamia backend bez dalszych pytań.
+  </purpose>
+
+  <runtime>
+    <workingDirectory>/mnt/data</workingDirectory>
+    <network>false</network>
+    <singleShot>true</singleShot>
+    <allowedWriteRoot>/mnt/data</allowedWriteRoot>
+    <defaultOutputRoot>/mnt/data/output</defaultOutputRoot>
+  </runtime>
+
+  <conversationPolicy>
+    <initialUserPrompt>Prześlij jeden plik PDF do analizy. Po otrzymaniu pliku uruchomię backend automatycznie i zwrócę summary.json oraz listę artefaktów.</initialUserPrompt>
+    <afterPdfReceived>Nie zadawaj dodatkowych pytań. Wybierz wskazany backend albo pierwszy zgodny backend w /mnt/data i uruchom analizę single-shot.</afterPdfReceived>
+    <missingPdfResponse>Brak pliku PDF w /mnt/data. Poproś użytkownika o przesłanie dokładnie jednego pliku PDF.</missingPdfResponse>
+    <multiplePdfResponse>Jeżeli użytkownik nie podał nazwy PDF, wybierz najnowszy plik PDF w /mnt/data według czasu modyfikacji i zapisz ostrzeżenie w wyniku.</multiplePdfResponse>
+  </conversationPolicy>
+
+  <inputContract>
+    <inputPdf required="true">/mnt/data/&lt;nazwa&gt;.pdf</inputPdf>
+    <backendModule required="false">/mnt/data/&lt;nazwa_backendu&gt;.py</backendModule>
+    <outputDir required="false">/mnt/data/output/&lt;nazwa_pdf&gt;</outputDir>
+  </inputContract>
+
+  <outputContract>
+    <required>/mnt/data/output/&lt;nazwa_pdf&gt;/summary.json</required>
+    <required>/mnt/data/output/&lt;nazwa_pdf&gt;/pages/*.md</required>
+    <required>/mnt/data/output/&lt;nazwa_pdf&gt;/tables/*.csv</required>
+    <required>/mnt/data/output/&lt;nazwa_pdf&gt;/graph.json</required>
+    <optional>/mnt/data/output/&lt;nazwa_pdf&gt;/ocr/*.json</optional>
+    <optional>/mnt/data/output/&lt;nazwa_pdf&gt;/symbols.json</optional>
+    <optional>/mnt/data/output/&lt;nazwa_pdf&gt;/devices.json</optional>
+    <optional>/mnt/data/output/&lt;nazwa_pdf&gt;/rooms.json</optional>
+    <optional>/mnt/data/output/&lt;nazwa_pdf&gt;/bom.json</optional>
+    <optional>/mnt/data/output/&lt;nazwa_pdf&gt;/legend.json</optional>
+  </outputContract>
+
+  <backendDiscovery>
+    <explicitFirst>true</explicitFirst>
+    <patterns>
+      <pattern>*backend*.py</pattern>
+      <pattern>*engine*.py</pattern>
+      <pattern>pipeline*.py</pattern>
+      <pattern>pdf_*.py</pattern>
+    </patterns>
+    <entrypoints>
+      <entrypoint>main(pdf_path, output_dir)</entrypoint>
+      <entrypoint>run(pdf_path, output_dir)</entrypoint>
+      <entrypoint>Pipeline().run(ctx)</entrypoint>
+    </entrypoints>
+  </backendDiscovery>
+
+  <python><![CDATA[
+from pathlib import Path
+import json
+import shutil
+import sys
+
+MNT_DATA = Path('/mnt/data')
+OUTPUT_ROOT = MNT_DATA / 'output'
+
+
+def _copy_if_needed(source_name: str) -> Path:
+    source = Path(source_name)
+    target = MNT_DATA / source.name
+    if source.resolve() != target.resolve():
+        shutil.copy2(source, target)
+    return target
+
+
+def initialize_environment() -> dict:
+    MNT_DATA.mkdir(parents=True, exist_ok=True)
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    if str(MNT_DATA) not in sys.path:
+        sys.path.insert(0, str(MNT_DATA))
+    return {
+        'status': 'ready',
+        'working_directory': str(MNT_DATA),
+        'output_root': str(OUTPUT_ROOT),
+        'message': 'Prześlij jeden plik PDF do analizy; backend uruchomi się automatycznie po otrzymaniu pliku.'
+    }
+
+
+def select_pdf(explicit_pdf: str | None = None) -> Path:
+    if explicit_pdf:
+        pdf = Path(explicit_pdf)
+        if not pdf.is_absolute():
+            pdf = MNT_DATA / pdf
+        if pdf.is_file() and pdf.suffix.lower() == '.pdf':
+            return pdf
+        raise FileNotFoundError(f'Brak pliku PDF: {pdf}')
+    pdfs = sorted(MNT_DATA.glob('*.pdf'), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not pdfs:
+        raise FileNotFoundError('Brak pliku PDF w /mnt/data. Prześlij jeden plik PDF do analizy.')
+    return pdfs[0]
+
+
+def run_after_pdf_received(pdf_path: str | None = None, backend_module: str | None = None) -> dict:
+    initialize_environment()
+    pdf = select_pdf(pdf_path)
+    from pdf_backend_launcher import run_pdf_analysis
+    output_dir = OUTPUT_ROOT / pdf.stem
+    return run_pdf_analysis(str(pdf), str(output_dir), backend_module)
+
+
+if __name__ == '__main__':
+    print(json.dumps(initialize_environment(), ensure_ascii=False, indent=2))
+]]></python>
+</codeInterpreterBootstrap>

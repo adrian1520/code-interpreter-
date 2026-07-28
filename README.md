@@ -6,6 +6,8 @@ Repo zawiera produkcyjny, jednoplikowy silnik analizy PDF oraz prosty launcher z
 
 - `pdf_self_engine.py` — finalny pipeline engine, loader backendu przez `importlib`, walidacja i eksport artefaktów.
 - `pdf_backend_launcher.py` — minimalny bootstrap do automatycznego uruchamiania analizy z poziomu Code Interpreter.
+- `bootstrap.xml` — deklaratywny bootstrap rozmowy i środowiska: inicjalizuje `/mnt/data`, prosi o PDF i po otrzymaniu pliku uruchamia backend.
+- `config.json` — konfiguracja Code Interpreter opisująca runtime, kontrakty, discovery backendu i zachowanie GPT.
 - `pipeline.py`, `pipeline_02.py` — wcześniejsze wersje robocze pozostawione dla kompatybilności.
 
 ## Kontrakt wejścia
@@ -61,6 +63,8 @@ Silnik wykonuje etapy w stałej kolejności:
 Silnik używa tekstu wektorowego jako pierwszego źródła. OCR przez PaddleOCR jest wywoływany wyłącznie jako fallback i nie jest zastępowany własnym algorytmem OCR. Tabele są ekstrahowane przez `pdfplumber`, strony renderowane przez PyMuPDF, preprocessing obrazu przez OpenCV/NumPy, eksport tabel przez Pandas, dopasowania tekstowe przez RapidFuzz, a graf dokumentu przez NetworkX.
 
 ## Uruchomienie w Code Interpreterze
+
+Opcjonalnie użyj `bootstrap.xml` i `config.json` jako deklaracji startowej: GPT ma najpierw poprosić o jeden PDF, a po jego otrzymaniu wykonać `run_pdf_analysis(...)` bez dalszych pytań.
 
 1. Wgraj PDF do `/mnt/data`, np. `/mnt/data/projekt.pdf`.
 2. Wgraj lub skopiuj backend do `/mnt/data`, np. `/mnt/data/pdf_self_engine.py` i opcjonalnie `/mnt/data/pdf_backend_launcher.py`.
