@@ -1,0 +1,98 @@
+name: Process PDFs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '**'
+
+jobs:
+  process_pdfs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install --no-cache-dir pymupdf pdfplumber numpy pandas opencv-python-headless networkx rapidfuzz
+          fi
+
+      - name: Find PDFs in repo root
+        id: find
+        run: |
+          shopt -s nullglob
+          files=(./*.pdf)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "FILES=" >> $GITHUB_OUTPUT
+          else
+            # join by newline
+            printf "%s\n" "${files[@]}" > pdf_list.txt
+            echo "FILES<<EOF" >> $GITHUB_OUTPUT
+            cat pdf_list.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare & run engine for each PDF (root only)
+        env:
+          FILES: ${{ steps.find.outputs.FILES }}
+        run: |
+          if [ -z "$FILES" ]; then
+            echo "No PDFs found in repo root."
+            exit 0
+          fi
+
+          mkdir -p processed
+
+          IFS=$'\n'
+          for src in $FILES; do
+            src=$(echo "$src" | sed 's|^./||')
+            echo "=== Processing: $src ==="
+            base=$(basename "$src" .pdf)
+
+            # Ensure /mnt/data exists and copy PDF there (pdf_self_engine expects /mnt/data)
+            sudo mkdir -p /mnt/data
+            sudo cp "$src" /mnt/data/
+
+            # Run prepare step (uses PreparePDF from repo)
+            echo "-- Running prepare (PreparePDF.run) --"
+            python - <<PY
+from prepare_pdf import PreparePDF
+from pathlib import Path
+src = Path('/mnt/data') / "${base}.pdf"
+out = Path('/mnt/data') / 'output' / '${base}'
+print('prepare input:', src)
+print('prepare output:', out)
+PreparePDF().run(str(src), str(out))
+print('prepare done')
+PY
+
+            # Run second engine (pdf_backend_launcher.py -> pdf_self_engine pipeline)
+            echo "-- Running second engine (pdf_backend_launcher) --"
+            python pdf_backend_launcher.py /mnt/data/${base}.pdf --output-dir /mnt/data/output/${base}-engine2 || echo "engine failed for ${base}"
+
+            # Collect outputs
+            dst="processed/${base}"
+            mkdir -p "$dst"
+            if [ -d "/mnt/data/output/${base}" ]; then
+              cp -r /mnt/data/output/${base}/* "$dst/" || true
+            fi
+            if [ -d "/mnt/data/output/${base}-engine2" ]; then
+              cp -r /mnt/data/output/${base}-engine2/* "$dst/" || true
+            fi
+          done
+
+      - name: Upload processed PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-pdfs
+          path: processed/**
